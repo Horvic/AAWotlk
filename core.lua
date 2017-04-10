@@ -11,7 +11,7 @@ BINDING_NAME_AngryAssign_WINDOW = "Toggle Window"
 BINDING_NAME_AngryAssign_LOCK = "Toggle Lock"
 BINDING_NAME_AngryAssign_DISPLAY = "Toggle Display"
 
-local AngryAssign_Version = 'v0.1'
+local AngryAssign_Version = 'v0.2'
 local AngryAssign_Timestamp = '@project-timestamp@'
 
 local default_channel = "RAID"
@@ -29,9 +29,11 @@ local officerGuildRank = 6 -- The lowest officer guild rank CHANGE
 local warnedOOD = false
 local versionList = {}
 
+local currentGroup = nil
+
 -- Pages Saved Variable Format 
 -- 	AngryAssign_Pages = {
--- 		[Id] = { Id = "1231", Updated = time(), Name = "Name", Contents = "..." },
+-- 		[Id] = { Id = "1231", Updated = time(), Name = "Name", Contents = "...", Backup = "..."},
 --		...
 -- 	}
 --
@@ -65,8 +67,8 @@ local REQUEST_PAGE_Id = 2
 local DISPLAY_Id = 2
 local DISPLAY_Updated = 3
 
-local VERSION_Version = 3
-local VERSION_Timestamp = 4
+local VERSION_Version = 2
+local VERSION_Timestamp = 3
 
 -------------------------
 -- Addon Communication --
@@ -105,14 +107,16 @@ function AngryAssign:ProcessMessage(sender, data)
 	self:Print("Received "..data[COMMAND].." from "..sender) -- CHANGE
 	if cmd == "PAGE" then
 		if not self:PermissionCheck(sender) or sender == UnitName('player') then return end
-
+		
+		local contents_updated = true
 		local id = data[PAGE_Id]
 		local page = AngryAssign_Pages[id]
 		if page then
-			if page.Updated >= data[PAGE_Updated] then return end -- The version sent is not newer then the one we already have
+			if page.Updated >= data[PAGE_Updated] then return end -- The version received is not newer then the one we already have
 
 			page.Updated = data[PAGE_Updated]
 			page.Name = data[PAGE_Name]
+			contents_updated = page.Contents ~= data[PAGE_Contents]
 			page.Contents = data[PAGE_Contents]
 
 			if self:SelectedId() == id then
@@ -125,6 +129,7 @@ function AngryAssign:ProcessMessage(sender, data)
 		if AngryAssign_State.displayed == id then
 			self:UpdateDisplayed()
 			self:ShowDisplay()
+			if contents_updated then self:DisplayUpdateNotification() end
 		end
 		self:UpdateTree()
 
@@ -135,20 +140,21 @@ function AngryAssign:ProcessMessage(sender, data)
 		local id = data[DISPLAY_Id]
 		local updated = data[DISPLAY_Updated]
 		local page = AngryAssign_Pages[id]
-		if not page or updated > page.Updated then
+		if id and (not page or updated > page.Updated) then
 			self:SendRequestPage(id, sender)
 		end
 		
 		if AngryAssign_State.displayed ~= id then
 			AngryAssign_State.displayed = id
+			self:UpdateTree()
 			self:UpdateDisplayed()
 			self:ShowDisplay()
-			self:UpdateTree()
+			self:DisplayUpdateNotification()
 		end
 
 	elseif cmd == "REQUEST_DISPLAY" then
 
-		self:SendDisplay(AngryAssign_State.displayed)
+		self:SendDisplay( AngryAssign_State.displayed )
 
 	elseif cmd == "REQUEST_PAGE" then
 		
@@ -156,10 +162,10 @@ function AngryAssign:ProcessMessage(sender, data)
 
 	elseif cmd == "VER_QUERY" then
 		local revToSend
-		local verToSend
+		local timestampToSend
 		if AngryAssign_Version:sub(1,1) == "@" then verToSend = "dev" else verToSend = AngryAssign_Version end
 		if AngryAssign_Timestamp:sub(1,1) == "@" then timestampToSend = "dev" else timestampToSend = tonumber(AngryAssign_Timestamp) end
-		self:SendMessage({ "VERSION", verToSend, timestampToSend })
+		self:SendMessage({ "VERSION", [VERSION_Version] = verToSend, [VERSION_Timestamp] = timestampToSend })
 
 
 	elseif cmd == "VERSION" then
@@ -208,12 +214,12 @@ function AngryAssign:SendPage(id, force)
 end
 
 function AngryAssign:SendPageMessage(id)
-	local page = AngryAssign_Pages[ id ]
-	if not page then error("Can't send page, does not exist"); return end
-	self:SendMessage({ "PAGE", [PAGE_Id] = page.Id, [PAGE_Updated] = page.Updated, [PAGE_Name] = page.Name, [PAGE_Contents] = page.Contents }) 
-
 	pageLastUpdate[id] = time()
 	pageTimerId[id] = nil
+	
+	local page = AngryAssign_Pages[ id ]
+	if not page then error("Can't send page, does not exist"); return end
+	self:SendMessage({ "PAGE", [PAGE_Id] = page.Id, [PAGE_Updated] = page.Updated, [PAGE_Name] = page.Name, [PAGE_Contents] = page.Contents }) 	
 end
 
 function AngryAssign:SendDisplay(id, force)
@@ -236,18 +242,22 @@ function AngryAssign:SendDisplay(id, force)
 end
 
 function AngryAssign:SendDisplayMessage(id)
-	local page = AngryAssign_Pages[ id ]
-	if not page then error("Can't display page, does not exist"); return end
-	self:SendMessage({ "DISPLAY", [DISPLAY_Id] = page.Id, [DISPLAY_Updated] = page.Updated }, "RAID") 
-
 	displayLastUpdate = time()
 	displayTimerId = nil
+	
+	local page = AngryAssign_Pages[ id ]
+	if not page then
+		self:SendMessage({ "DISPLAY", [DISPLAY_Id] = nil, [DISPLAY_Updated] = nil }, "RAID") 
+	else
+		self:SendMessage({ "DISPLAY", [DISPLAY_Id] = page.Id, [DISPLAY_Updated] = page.Updated }, "RAID") 
+	end
 end
 
 function AngryAssign:SendRequestDisplay()
 	--if IsInRaid(LE_PARTY_CATEGORY_HOME) then
 	if ((GetNumPartyMembers() >= 0) and (GetNumRaidMembers() > 0)) then
-		self:SendMessage({ "REQUEST_DISPLAY" }, "WHISPER", self:GetRaidLeader()) 
+		local to = self:GetRaidLeader()
+		if to then self:SendMessage({ "REQUEST_DISPLAY" }, "WHISPER", to) end
 	end
 end
 
@@ -255,7 +265,7 @@ function AngryAssign:SendRequestPage(id, to)
 	--if IsInRaid(LE_PARTY_CATEGORY_HOME) or to then
 	if ((GetNumPartyMembers() >= 0) and (GetNumRaidMembers() > 0)) or to then
 		if not to then to = self:GetRaidLeader() end
-		self:SendMessage({ "REQUEST_PAGE", [REQUEST_PAGE_Id] = id }, "WHISPER", to)
+		if to then self:SendMessage({ "REQUEST_PAGE", [REQUEST_PAGE_Id] = id }, "WHISPER", to) end
 	end
 end
 
@@ -273,6 +283,19 @@ function AngryAssign:GetRaidLeader()
 	return nil
 end
 
+function AngryAssign:GetCurrentGroup()
+	local player = UnitName('player')
+	if ((GetNumPartyMembers() >= 0) and (GetNumRaidMembers() > 0)) then
+		for i = 1, GetNumRaidMembers() do
+			local name, _, subgroup = GetRaidRosterInfo(i)
+			if name == player then
+				return subgroup
+			end
+		end
+	end
+	return nil
+end
+
 function AngryAssign:VersionCheckOutput()
 	local versionliststr = ""
 	for i,v in pairs(versionList) do
@@ -284,15 +307,17 @@ function AngryAssign:VersionCheckOutput()
 	if ((GetNumPartyMembers() >= 0) and (GetNumRaidMembers() > 0)) then
 		--for i = 1, GetNumGroupMembers() do
 		for i = 1, GetNumRaidMembers() do
-			name = GetRaidRosterInfo(i)	
-			local found = false
-			for i,v in pairs(versionList) do
-				if v["name"] == name then
-					found = true
-					break
+			local name, _, _, _, _, _, _, _, online = GetRaidRosterInfo(i)
+			if online then
+				local found = false
+				for i,v in pairs(versionList) do
+					if v["name"] == name then
+						found = true
+						break
+					end
 				end
+				if not found then versionliststr = versionliststr .. " " .. name end
 			end
-			if not found then versionliststr = versionliststr .. " " .. name end
 		end
 	end
 	if versionliststr ~= "" then self:Print("Not running:"..versionliststr) end
@@ -371,7 +396,7 @@ local function AngryAssign_RenamePage(widget, event, value)
 			preferredIndex = 3
 		}
 	end
-	StaticPopupDialogs[popup_name].text = 'Rename page "'.. page.Name ..'" to?'
+	StaticPopupDialogs[popup_name].text = 'Rename page "'.. page.Name ..'" to:'
 
 	StaticPopup_Show(popup_name)
 end
@@ -403,6 +428,7 @@ local function AngryAssign_RevertPage(widget, event, value)
 	if not AngryAssign.window then return end
 	AngryAssign.window.text:SetText( AngryAssign_Pages[AngryAssign:SelectedId()].Contents )
 	AngryAssign.window.button_revert:SetDisabled(true)
+	AngryAssign.window.button_display:SetDisabled(false)
 end
 
 local function AngryAssign_DisplayPage(widget, event, value)
@@ -414,21 +440,34 @@ local function AngryAssign_DisplayPage(widget, event, value)
 	AngryAssign:SendDisplay( id, true )
 	
 	--if IsInRaid(LE_PARTY_CATEGORY_HOME) then
-	if((GetNumPartyMembers() >= 0) and (GetNumRaidMembers() > 0)) then
+	if((GetNumPartyMembers() >= 0) and (GetNumRaidMembers() > 0)) and AngryAssign_State.displayed ~= id then
 		AngryAssign_State.displayed = AngryAssign:SelectedId()
 		AngryAssign:UpdateDisplayed()
 		AngryAssign:ShowDisplay()
 		AngryAssign:UpdateTree()
+		AngryAssign:DisplayUpdateNotification()
 	end
 end
 
 local function AngryAssign_TextChanged(widget, event, value)
 	AngryAssign.window.button_revert:SetDisabled(false)
+	AngryAssign.window.button_display:SetDisabled(true)
 end
 
 local function AngryAssign_TextEntered(widget, event, value)
 	AngryAssign:UpdateContents(AngryAssign:SelectedId(), value)
 	AngryAssign.window.button_revert:SetDisabled(true)
+	AngryAssign.window.button_display:SetDisabled(false)
+end
+
+local function AngryAssign_RestorePage(widget, event, value)
+	if not AngryAssign.window then return end
+	local page = AngryAssign_Pages[AngryAssign:SelectedId()]
+	if not page or not page.Backup then return end
+	
+	AngryAssign.window.text:SetText( page.Backup )
+	AngryAssign.window.text.button:Enable()
+	AngryAssign_TextChanged(widget, event, value)
 end
 
 function AngryAssign:CreateWindow()
@@ -489,7 +528,7 @@ function AngryAssign:CreateWindow()
 
 	local button_revert = AceGUI:Create("Button")
 	button_revert:SetText("Revert")
-	button_revert:SetWidth(75)
+	button_revert:SetWidth(80)
 	button_revert:SetHeight(22)
 	button_revert:ClearAllPoints()
 	button_revert:SetDisabled(true)
@@ -497,11 +536,21 @@ function AngryAssign:CreateWindow()
 	button_revert:SetCallback("OnClick", AngryAssign_RevertPage)
 	tree:AddChild(button_revert)
 	window.button_revert = button_revert
+	
+	local button_restore = AceGUI:Create("Button")
+	button_restore:SetText("Restore")
+	button_restore:SetWidth(80)
+	button_restore:SetHeight(22)
+	button_restore:ClearAllPoints()
+	button_restore:SetPoint("LEFT", button_revert.frame, "RIGHT", 6, 0)
+	button_restore:SetCallback("OnClick", AngryAssign_RestorePage)
+	tree:AddChild(button_restore)
+	window.button_restore = button_restore
 
 	window:PauseLayout()
 	local button_add = AceGUI:Create("Button")
 	button_add:SetText("Add")
-	button_add:SetWidth(70)
+	button_add:SetWidth(80)
 	button_add:SetHeight(19)
 	button_add:ClearAllPoints()
 	button_add:SetPoint("BOTTOMLEFT", window.frame, "BOTTOMLEFT", 17, 18)
@@ -521,7 +570,7 @@ function AngryAssign:CreateWindow()
 
 	local button_delete = AceGUI:Create("Button")
 	button_delete:SetText("Delete")
-	button_delete:SetWidth(70)
+	button_delete:SetWidth(80)
 	button_delete:SetHeight(19)
 	button_delete:ClearAllPoints()
 	button_delete:SetPoint("BOTTOMLEFT", button_rename.frame, "BOTTOMRIGHT", 5, 0)
@@ -553,9 +602,15 @@ function AngryAssign:SelectedUpdated(sender)
 end
 
 function AngryAssign:GetTree()
-	local ret = {}
+	--local ret = {}
+	local sortTable = {}
 
 	for _, page in pairs(AngryAssign_Pages) do
+		tinsert(sortTable, { Id = page.Id, Name = page.Name })
+	end
+	table.sort( sortTable, function(a,b) return a.Name < b.Name end)
+	local ret = {}
+	for _, page in ipairs(sortTable) do
 		if page.Id == AngryAssign_State.displayed then
 			tinsert(ret, { value = page.Id, text = page.Name, icon = "Interface\\BUTTONS\\UI-GuildButton-MOTD-Up" })
 		else
@@ -587,16 +642,24 @@ function AngryAssign:UpdateSelected(destructive)
 	end
 	if page and permission then
 		self.window.button_rename:SetDisabled(false)
-		self.window.button_delete:SetDisabled(false)
+		--self.window.button_delete:SetDisabled(false)
 		self.window.button_revert:SetDisabled(not self.window.text.button:IsEnabled())
-		self.window.button_display:SetDisabled(false)
+		self.window.button_display:SetDisabled(self.window.text.button:IsEnabled())
+		self.window.button_restore:SetDisabled(not page.Backup)
+		--self.window.button_display:SetDisabled(false)
 		self.window.text:SetDisabled(false)
 	else
 		self.window.button_rename:SetDisabled(true)
-		self.window.button_delete:SetDisabled(true)
+		--self.window.button_delete:SetDisabled(true)
 		self.window.button_revert:SetDisabled(true)
 		self.window.button_display:SetDisabled(true)
+		self.window.button_restore:SetDisabled(true)
 		self.window.text:SetDisabled(true)
+	end
+	if page then
+		self.window.button_delete:SetDisabled(false)
+	else
+		self.window.button_delete:SetDisabled(true)
 	end
 	if permission then
 		self.window.button_add:SetDisabled(false)
@@ -643,7 +706,7 @@ function AngryAssign:RenamePage(id, name)
 end
 
 function AngryAssign:DeletePage(id)
-	if not self:PermissionCheck() then return end
+	--if not self:PermissionCheck() then return end
 	AngryAssign_Pages[id] = nil
 	if self.window and self:SelectedId() == id then
 		self.window.tree:SetSelected(nil)
@@ -668,7 +731,11 @@ function AngryAssign:UpdateContents(id, value)
 	local page = self:Get(id)
 	if not page then return end
 
-	page.Contents = value:gsub('^%s+', ''):gsub('%s+$', '')
+	--page.Contents = value:gsub('^%s+', ''):gsub('%s+$', '')
+	local new_content = value:gsub('^%s+', ''):gsub('%s+$', '')
+	local contents_updated = new_content ~= page.Contents
+	page.Contents = new_content
+	page.Backup = new_content
 	page.Updated = time()
 
 	self:SendPage(id, true)
@@ -676,7 +743,15 @@ function AngryAssign:UpdateContents(id, value)
 	if AngryAssign_State.displayed == id then
 		self:UpdateDisplayed()
 		self:ShowDisplay()
+		if contents_updated then self:DisplayUpdateNotification() end
 	end
+end
+
+function AngryAssign:CreateBackup()
+	for _, page in pairs(AngryAssign_Pages) do
+		page.Backup = page.Contents
+	end
+	self:UpdateSelected()
 end
 
 function AngryAssign:GetGuildRank(player)
@@ -705,8 +780,8 @@ function AngryAssign:PermissionCheck(sender)
 	if self:GetGuildRank(sender) <= officerGuildRank then
 		return true
 	--elseif IsInRaid(LE_PARTY_CATEGORY_HOME) and (UnitIsGroupLeader(sender) or UnitIsGroupAssistant(sender)) and self:GetGuildRank(self:GetRaidLeader()) <= officerGuildRank then
-	--elseif((GetNumPartyMembers() >= 0) and (GetNumRaidMembers() > 0)) and (IsRaidLeader(sender) or IsRaidOfficer(sender)) and self:GetGuildRank(self:GetRaidLeader()) <= officerGuildRank then
-	elseif((GetNumPartyMembers() >= 0) and (GetNumRaidMembers() > 0)) then
+	elseif((GetNumPartyMembers() >= 0) and (GetNumRaidMembers() > 0)) and (IsRaidLeader(sender) or IsRaidOfficer(sender)) and self:GetGuildRank(self:GetRaidLeader()) <= officerGuildRank then
+	--elseif((GetNumPartyMembers() >= 0) and (GetNumRaidMembers() > 0)) then
 		return true
 	else
 		return false --IsRaidLeader() or IsRaidOfficer()
@@ -763,6 +838,7 @@ function AngryAssign:CreateDisplay()
 	frame:SetResizable(true)
 	frame:SetMinResize(180,1)
 	frame:SetMaxResize(830,1)
+	frame:SetFrameStrata("MEDIUM")	
 
 	lwin.RegisterConfig(frame, AngryAssign_State.display)
 	lwin.RestorePosition(frame)
@@ -773,9 +849,9 @@ function AngryAssign:CreateDisplay()
 	text:SetFading(false)
 	text:SetMaxLines(70)
 	text:SetHeight(700)
-	text:SetHyperlinksEnabled(enable)
+	text:SetHyperlinksEnabled(false)
 	self.display_text = text
-	if AngryAssign_State.display.hidden then text:Hide() end
+	--if AngryAssign_State.display.hidden then text:Hide() end
 
 	local mover = CreateFrame("Frame", nil, frame)
 	mover:SetPoint("LEFT",0,0)
@@ -829,7 +905,22 @@ function AngryAssign:CreateDisplay()
 	dragtex:SetHeight(16)
 	dragtex:SetBlendMode("ADD")
 	dragtex:SetPoint("CENTER", drag)
-
+	
+	local glow = text:CreateTexture(nil, "BACKGROUND")
+	glow:SetTexture("Interface\\LevelUp\\LevelUpTex")
+	glow:SetSize(223, 115)
+	glow:SetTexCoord(0.56054688, 0.99609375, 0.24218750, 0.46679688)
+	glow:SetVertexColor(1, 0, 0, 1)
+	glow:SetAlpha(0)
+	self.display_glow = glow
+	local glow2 = text:CreateTexture(nil, "BACKGROUND")
+	glow2:SetTexture("Interface\\LevelUp\\LevelUpTex")
+	glow2:SetSize(418, 7)
+	glow2:SetTexCoord(0.00195313, 0.81835938, 0.01953125, 0.03320313)
+	glow2:SetVertexColor(1, 0, 0, 1)
+	glow2:SetAlpha(0)
+	self.display_glow2 = glow2
+	if AngryAssign_State.display.hidden then text:Hide() end
 	self:UpdateMedia()
 	self:UpdateDirection()
 end
@@ -856,6 +947,12 @@ function AngryAssign:UpdateDirection()
 		self.display_text:SetInsertMode("BOTTOM")
 		self.direction_button:GetNormalTexture():SetTexCoord(0, 0.5, 0.5, 1)
 		self.direction_button:GetPushedTexture():SetTexCoord(0.5, 1, 0.5, 1)
+		
+		self.display_glow:ClearAllPoints()
+		self.display_glow:SetPoint("BOTTOM", 0, -4)
+		self.display_glow:SetTexCoord(0.56054688, 0.99609375, 0.24218750, 0.46679688)
+		self.display_glow2:ClearAllPoints()
+		self.display_glow2:SetPoint("TOP", self.display_glow, "BOTTOM", 0, 6)
 	else
 		self.display_text:ClearAllPoints()
 		self.display_text:SetPoint("TOPLEFT", 0, -8)
@@ -863,52 +960,121 @@ function AngryAssign:UpdateDirection()
 		self.display_text:SetInsertMode("TOP")
 		self.direction_button:GetNormalTexture():SetTexCoord(0, 0.5, 0, 0.5)
 		self.direction_button:GetPushedTexture():SetTexCoord(0.5, 1, 0, 0.5)
+		
+		self.display_glow:ClearAllPoints()
+		self.display_glow:SetPoint("TOP", 0, 4)
+		self.display_glow:SetTexCoord(0.56054688, 0.99609375, 0.46679688, 0.24218750)
+		self.display_glow2:ClearAllPoints()
+		self.display_glow2:SetPoint("BOTTOM", self.display_glow, "TOP", 0, 0)
 	end
-	self.display_text:Hide()
-	self.display_text:Show()
+	if self.display_text:IsShown() then
+		self.display_text:Hide()
+		self.display_text:Show()
+	end
 	self:UpdateDisplayed()
 end
 
 function AngryAssign:UpdateMedia()
-	local font = CreateFont("AngryAssign")
-	font:CopyFontObject("GameFontHighlight")
-	local fontName, fontHeight, fontFlags = font:GetFont()
-	if AngryAssign_Config.fontName then fontName = LSM:Fetch("font", AngryAssign_Config.fontName) end
-	if AngryAssign_Config.fontHeight then fontHeight = AngryAssign_Config.fontHeight end
-	if AngryAssign_Config.fontFlags then fontFlags = AngryAssign_Config.fontFlags end
-
-	font:SetFont(fontName, fontHeight, fontFlags)
-	self.display_text:SetFontObject(font)
+	local fontName = LSM:Fetch("font", AngryAssign_Config.fontName)
+	local fontHeight = AngryAssign_Config.fontHeight
+	local fontFlags = AngryAssign_Config.fontFlags
+	self.display_text:SetFont(fontName, fontHeight, fontFlags)
 end
 
+local updateFlasher, updateFlasher2 = nil, nil
 function AngryAssign:DisplayUpdateNotification()
+	if updateFlasher == nil then
+		updateFlasher = self.display_glow:CreateAnimationGroup() 
+		-- Flashing in
+		local fade1 = updateFlasher:CreateAnimation("Alpha")
+		fade1:SetDuration(0.5)
+		fade1:SetChange(1)
+		fade1:SetOrder(1)
+		-- Holding it visible for 1 second
+		fade1:SetEndDelay(5)
+		-- Flashing out
+		local fade2 = updateFlasher:CreateAnimation("Alpha")
+		fade2:SetDuration(0.5)
+		fade2:SetChange(-1)
+		fade2:SetOrder(3)
+	end
+	if updateFlasher2 == nil then
+		updateFlasher2 = self.display_glow2:CreateAnimationGroup() 
+		-- Flashing in
+		local fade1 = updateFlasher2:CreateAnimation("Alpha")
+		fade1:SetDuration(0.5)
+		fade1:SetChange(1)
+		fade1:SetOrder(1)
+		-- Holding it visible for 1 second
+		fade1:SetEndDelay(5)
+		-- Flashing out
+		local fade2 = updateFlasher2:CreateAnimation("Alpha")
+		fade2:SetDuration(0.5)
+		fade2:SetChange(-1)
+		fade2:SetOrder(3)
+	end
+	updateFlasher:Play()
+	updateFlasher2:Play()
+end
+
+local function ci_pattern(pattern)
+	local p = pattern:gsub("(%%?)(.)", function(percent, letter)
+		if percent ~= "" or not letter:match("%a") then
+			return percent .. letter
+		else
+			return string.format("[%s%s]", letter:lower(), letter:upper())
+		end
+	end)
+	return p
+end
+
+local function RGBToHex(r, g, b)
+	r = math.ceil(255 * r)
+	g = math.ceil(255 * g)
+	b = math.ceil(255 * b)
+	return string.format("%02x%02x%02x", r, g, b)
+end
+
+function AngryAssign:UpdateDisplayedIfNewGroup()
+	local newGroup = self:GetCurrentGroup()
+	if newGroup ~= currentGroup then
+		currentGroup = newGroup
+		self:UpdateDisplayed()
+	end
 end
 
 function AngryAssign:UpdateDisplayed()
 	local page = AngryAssign_Pages[ AngryAssign_State.displayed ]
 	if page then
 		local text = page.Contents
+		
+		local highlightHex = RGBToHex(AngryAssign_Config.highlightColorR, AngryAssign_Config.highlightColorG, AngryAssign_Config.highlightColorB)
 
 		text = text:gsub("||", "|")
 		for token in string.gmatch( AngryAssign_Config.highlight or "" , "[^%s%p]+") do
-			text = text:gsub(token, NORMAL_FONT_COLOR_CODE ..token.."|r")
+			--text = text:gsub(token, NORMAL_FONT_COLOR_CODE ..token.."|r")
+			if token:lower() == 'group'then
+				token = 'G'..(currentGroup or 0)
+			end
+			text = text:gsub(ci_pattern(token), "|cff" .. highlightHex .. "%0|r")
 		end
 
-		text = text:gsub("{[Ss][Tt][Aa][Rr]}", "{rt1}")
-			:gsub("{[Cc][Ii][Rr][Cc][Ll][Ee]}", "{rt2}")
-			:gsub("{[Dd][Ii][Aa][Mm][Oo][Nn][Dd]}", "{rt3}")
-			:gsub("{[Tt][Rr][Ii][Aa][Nn][Gg][Ll][Ee]}", "{rt4}")
-			:gsub("{[Mm][Oo][Oo][Nn]}", "{rt5}")
-			:gsub("{[Ss][Qq][Uu][Aa][Rr][Ee]}", "{rt6}")
-			:gsub("{[Cc][Rr][Oo][Ss][Ss]}", "{rt7}")
-			:gsub("{[Xx]}", "{rt7}")
-			:gsub("{[Ss][Kk][Uu][Ll][Ll]}", "{rt8}")
-			:gsub("{[Rr][Tt]([1-8])}", "|TInterface\\TargetingFrame\\UI-RaidTargetingIcon_%1:0|t" )
-			:gsub("{[Hh][Ee][Aa][Ll][Tt][Hh][Ss][Tt][Oo][Nn][Ee]}", "{hs}")
-			:gsub("{[Hh][Ss]}", "|TInterface\\Icons\\INV_Stone_04:0|t")
-			:gsub("{[Bb][Ll][Oo][Oo][Dd][Ll][Uu][Ss][Tt]}", "{bl}")
-			:gsub("{[Bb][Ll]}", "|TInterface\\Icons\\SPELL_Nature_Bloodlust:0|t")
-
+		text = text:gsub(ci_pattern('{star}'), "{rt1}")
+			:gsub(ci_pattern('{circle}'), "{rt2}")
+			:gsub(ci_pattern('{diamond}'), "{rt3}")
+			:gsub(ci_pattern('{triangle}'), "{rt4}")
+			:gsub(ci_pattern('{moon}'), "{rt5}")
+			:gsub(ci_pattern('{square}'), "{rt6}")
+			:gsub(ci_pattern('{cross}'), "{rt7}")
+			:gsub(ci_pattern('{x}'), "{rt7}")
+			:gsub(ci_pattern('{skull}'), "{rt8}")
+			:gsub(ci_pattern('{rt([1-8])}'), "|TInterface\\TargetingFrame\\UI-RaidTargetingIcon_%1:0|t" )
+			:gsub(ci_pattern('{healthstone}'), "{hs}")
+			:gsub(ci_pattern('{hs}'), "|TInterface\\Icons\\INV_Stone_04:0|t")
+			:gsub(ci_pattern('{bloodlust}'), "{bl}")
+			:gsub(ci_pattern('{bl}'), "|TInterface\\Icons\\SPELL_Nature_Bloodlust:0|t")
+			:gsub(ci_pattern('{icon%s+([%w_]+)}'), "|TInterface\\Icons\\%1:0|t")
+		
 		self.display_text:Clear()
 		local lines = { strsplit("\n", text) }
 		local lines_count = #lines
@@ -935,8 +1101,10 @@ end
 function AngryAssign:OnInitialize()
 	if AngryAssign_State == nil then AngryAssign_State = { tree = {}, window = {}, display = {}, displayed = nil, locked = false, directionUp = false } end
 	if AngryAssign_Pages == nil then AngryAssign_Pages = { } end
-	if AngryAssign_Config == nil then AngryAssign_Config = { scale = 1 } end
-
+	if AngryAssign_Config == nil then AngryAssign_Config = { scale = 1, fontName = "Friz Quadrata TT", fontHeight = 12, fontFlags = "NONE" } end
+	if not AngryAssign_Config.highlightColorR then AngryAssign_Config.highlightColorR = 1 end
+	if not AngryAssign_Config.highlightColorG then AngryAssign_Config.highlightColorG = 0.824 end
+	if not AngryAssign_Config.highlightColorB then AngryAssign_Config.highlightColorB = 0 end
 
 	local options = {
 		name = "Angry Assignments",
@@ -967,19 +1135,29 @@ function AngryAssign:OnInitialize()
 				func = function()
 					AngryAssign_State.displayed = nil
 					AngryAssign_Pages = {}
-					AngryAssign:UpdateTree()
-					AngryAssign:UpdateSelected()
-					AngryAssign:UpdateDisplayed()
-					if AngryAssign.window then AngryAssign.window.tree:SetSelected(nil) end
-					AngryAssign:Print("All pages have been deleted.")
+					self:UpdateTree()
+					self:UpdateSelected()
+					self:UpdateDisplayed()
+					if self.window then self.window.tree:SetSelected(nil) end
+					self:Print("All pages have been deleted.")
+				end
+			},
+			backup = {
+				type = "execute",
+				order = 7,
+				name = "Backup Pages",
+				desc = "Creates a backup of all pages with their current contents",
+				func = function() 
+					self:CreateBackup()
+					self:Print("Created a backup of all pages.")
 				end
 			},
 			version = {
 				type = "execute",
-				order = 7,
+				order = 8,
 				name = "Version Check",
 				desc = "Displays a list of all users (in the guild) running the addon and the version they're running",
-				func = function() 
+				func = function()
 					versionList = {} -- start with a fresh version list, when displaying it
 					self:SendMessage({ "VER_QUERY" }) 
 					self:ScheduleTimer("VersionCheckOutput", 2)
@@ -991,7 +1169,7 @@ function AngryAssign:OnInitialize()
 				order = 2,
 				name = "Toggle Lock",
 				desc = "Shows/hides the display mover (also available in game keybindings)",
-				func = function() AngryAssign:ToggleLock() end
+				func = function() self:ToggleLock() end
 			},
 			config = { 
 				type = "group",
@@ -1003,16 +1181,29 @@ function AngryAssign:OnInitialize()
 						type = "input",
 						order = 1,
 						name = "Highlight",
-						desc = "A list of words to highlight on displayed pages (separated by spaces or punctuation)",
+						desc = "A list of words to highlight on displayed pages (separated by spaces or punctuation)\n\nUse 'Group' to highlight the current group you are in, ex. G2",
 						get = function(info) return AngryAssign_Config.highlight end,
 						set = function(info, val)
 							AngryAssign_Config.highlight = val
-							AngryAssign:UpdateDisplayed()
+							self:UpdateDisplayed()
+						end
+					},
+					highlightcolor = {
+						type = "color",
+						order = 2,
+						name = "Highlight Color",
+						desc = "The color used to emphasize highlighted words",
+						get = function(info) return AngryAssign_Config.highlightColorR, AngryAssign_Config.highlightColorG, AngryAssign_Config.highlightColorB end,
+						set = function(info, r, g, b)
+							AngryAssign_Config.highlightColorR = r
+							AngryAssign_Config.highlightColorG = g
+							AngryAssign_Config.highlightColorB = b
+							self:UpdateDisplayed()
 						end
 					},
 					hideoncombat = {
 						type = "toggle",
-						order = 2,
+						order = 3,
 						name = "Hide on Combat",
 						desc = "Enable to hide display frame upon entering combat",
 						get = function(info) return AngryAssign_Config.hideoncombat end,
@@ -1022,7 +1213,7 @@ function AngryAssign:OnInitialize()
 					},
 					scale = {
 						type = "range",
-						order = 3,
+						order = 4,
 						name = "Scale",
 						desc = function() 
 							return "Sets the scale of the edit window"
@@ -1055,7 +1246,7 @@ function AngryAssign:OnInitialize()
 						end,
 						set = function(self,key)
 							AngryAssign_Config.fontName = key
-							AngryAssign:UpdateMedia()
+							self:UpdateMedia()
 						end
 					},
 					fontheight = {
@@ -1071,7 +1262,7 @@ function AngryAssign:OnInitialize()
 						get = function(info) return AngryAssign_Config.fontHeight end,
 						set = function(info, val)
 							AngryAssign_Config.fontHeight = val
-							AngryAssign:UpdateMedia()
+							self:UpdateMedia()
 						end
 					},
 					fontflags = {
@@ -1085,7 +1276,7 @@ function AngryAssign:OnInitialize()
 						get = function(info) return AngryAssign_Config.fontFlags end,
 						set = function(info, val)
 							AngryAssign_Config.fontFlags = val
-							AngryAssign:UpdateMedia()
+							self:UpdateMedia()
 						end
 					}
 				}
@@ -1099,6 +1290,7 @@ function AngryAssign:OnInitialize()
 end
 
 function AngryAssign:OnEnable()
+	currentGroup = self:GetCurrentGroup()
 	self:CreateDisplay()
 
 	self:RegisterComm(comPrefix, "ReceiveMessage")
@@ -1119,16 +1311,18 @@ function AngryAssign:OnEnable()
 	end
 end
 
-function AngryAssign:RAID_ROSTER_UPDATE()
-	self:UpdateSelected()
-end
+--function AngryAssign:RAID_ROSTER_UPDATE()
+--	self:UpdateSelected()
+--end
 
 function AngryAssign:PARTY_CONVERTED_TO_RAID()
 	self:SendRequestDisplay()
+	self:UpdateDisplayedIfNewGroup()
 end
 
 function AngryAssign:GROUP_JOINED()
 	self:SendRequestDisplay()
+	self:UpdateDisplayedIfNewGroup()
 end
 
 function AngryAssign:PLAYER_REGEN_DISABLED()
@@ -1142,6 +1336,8 @@ function AngryAssign:GROUP_ROSTER_UPDATE()
 	--if AngryAssign_State.displayed and not IsInRaid(LE_PARTY_CATEGORY_HOME) then
 	if AngryAssign_State.displayed and ((GetNumPartyMembers() == 0) and (GetNumRaidMembers() == 0)) then
 		self:ClearDisplayed()
+	else
+		self:UpdateDisplayedIfNewGroup()
 	end
 end
 
